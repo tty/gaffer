@@ -3,29 +3,30 @@
 -behaviour(gen_server).
 
 %% API
--export([start_link/0]).
+-export([start_link/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
+-export([key/0]).
 
 -define(SERVER, ?MODULE). 
 
--record(state, {}).
+-record(state, {key,url}).
 
 %%----------------------------------------------------------------------------
 %% API
 %%----------------------------------------------------------------------------
 
-start_link() ->
-    gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
+start_link(Url) ->
+    gen_server:start_link(?MODULE, [Url], []).
 
 %%----------------------------------------------------------------------------
-%%% gen_server callbacks
+%% gen_server callbacks
 %%----------------------------------------------------------------------------
 
-init([]) ->
-    {ok, #state{}}.
+init([Url]) ->
+    {ok, #state{url = Url, key = key()}}.
 
 handle_call(_Request, _From, State) ->
     Reply = ok,
@@ -43,6 +44,19 @@ terminate(_Reason, _State) ->
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
+
+%%----------------------------------------------------------------------------
+%% Internal functions 
+%%----------------------------------------------------------------------------
+
+key() ->
+    {A1,A2,A3} = now(),
+    random:seed(A1,A2,A3),
+    base64:encode(<< <<(random:uniform(256))>> || _N <- lists:seq(1,16) >>).
+
+%% handshake_request(Url) ->
+%%     {ok,{ws,[],Host,Port,Path,[]}} = http_uri:parse(Url).
+    
 %% Local variables:
 %% mode: erlang
 %% fill-column: 78
