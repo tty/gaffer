@@ -1,0 +1,10 @@
+%% -*- mode: erlang; fill-column: 78; -*-
+
+{application, gaffer,
+ [{description, "Gaffer - Websocket Client"},
+  {vsn, "1"},
+  {registered, []},
+  {applications, [kernel,
+                  stdlib]},
+  {mod, {gaffer_app, []}},
+  {env, []}]}.
