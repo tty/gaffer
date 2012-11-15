@@ -1,2 +1,4 @@
 Gaffer: An Erlang websocket client
 Intended for testing purposes. Dont use in production builds - yet.
+
+Inspiration found here: http://muppet.wikia.com/wiki/Gaffer
