@@ -18,13 +18,14 @@
 start_link() ->
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
-
 %%----------------------------------------------------------------------------
 %% supervisor callbacks
 %%----------------------------------------------------------------------------
 
 init([]) ->
-    {ok, { {one_for_one, 5, 10}, []} }.
+    {ok, {{simple_one_for_one, 0, 1},
+          [{gaffer_ws_client, {gaffer_ws_client, start_link, []},
+            temporary, brutal_kill, worker, [gaffer_ws_client]}]}}.
 
 %% Local variables:
 %% mode: erlang
