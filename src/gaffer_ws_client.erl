@@ -6,6 +6,11 @@
 -export([start_link/1]).
 -export([connect/1]).
 -export([send/2]).
+-export([frame/1]).
+-export([unframe/1]).
+-export([decode_len/1]).
+-export([encode_len/1]).
+-export([mask/2]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -53,7 +58,7 @@ handle_cast(connect, State = #state{host = Host, port = Port, path = Path, key =
     {noreply, State#state{sock = Sock}};
 handle_cast({send, Data}, State = #state{sock = Sock}) ->
     io:format("Sending: ~p~n", [Data]),
-    Result = gen_tcp:send(Sock, Data),
+    Result = gen_tcp:send(Sock, frame(Data)),
     io:format("result: ~p~n", [Result]),
     {noreply, State}.
 
@@ -64,6 +69,13 @@ handle_info({http,_,{http_header,_,Name,_,Value}}, State = #state{readystate = ?
     {noreply, State#state{headers=H}};
 handle_info({http,_,http_eoh},State) ->
     {noreply, handshake(State)};
+handle_info({tcp,_,Data}, State = #state{readystate = ?OPEN}) ->
+    handleframe(Data),
+    {noreply, State};
+handle_info({tcp_closed, _Socket},State) ->
+    {stop,normal,State};
+handle_info({tcp_error, _Socket, _Reason},State) ->
+    {stop,tcp_error,State};
 handle_info(Info, State) ->
     io:format("INFO = ~p~n", [Info]),
     {noreply, State}.
@@ -106,6 +118,61 @@ handshake(State = #state{readystate = ?CONNECTING, sock = Sock, key = Key, heade
             State#state{readystate = ?CLOSED}
     end.
     
+handleframe(Data) ->
+  unframe(Data).
+
+mask(<<>>, _) ->
+    <<>>;
+mask(<<D:24>>, <<M:24, _:8>>) ->
+   crypto:exor(<<D:24>>, <<M:24>>);
+mask(<<D:16>>, <<M:16, _:16>>) ->
+   crypto:exor(<<D:16>>, <<M:16>>);
+mask(<<D>>, <<M, _:24>>) ->
+   crypto:exor(<<D:8>>, <<M:8>>);
+mask(<<D:32, Rest/bits >>, M) ->
+   Data = crypto:exor(<<D:32>>, M),
+   MaskedRest = mask(Rest, M),
+   %% io:format("Maskedrest: ~p Data: ~p ~n", [MaskedRest,Data]),
+   << Data:32/bits, MaskedRest/bits >>.
+
+unmask(0, Data) ->
+    Data;
+unmask(1, << Mask:32, Data/bits >> ) ->
+    io:format("Mask: ~p ~n", [Mask]),
+    mask(Data, <<Mask:32>>).
+
+unframe(<< F:1, R:3, Op:4, M:1, Data/bits >>) ->
+    io:format("Frame received F: ~p R: ~p Op: ~p M: ~p~n", [F,R,Op,M]),
+    {Len, Rest} = decode_len(Data),
+    io:format("Payload len: ~p ~n", [Len]),
+    unmask(M,Rest).
+
+frame(Data) ->
+    F = 1,
+    R = 0,
+    Op = 1,
+    M = 1,
+    Size = byte_size( Data ),
+    Len = encode_len(Size),
+    Mask = random:uniform(4294967296),
+    %% io:format("Frame received F: ~p R: ~p Op: ~p M: ~p Len: ~p ~n", [F,R,Op,M,Len]),
+    MaskedData = mask(Data, <<Mask:32>>),
+    << F:1, R:3, Op:4, M:1, Len/bits, Mask:32, MaskedData/binary >>.
+
+encode_len(Len) when Len < 126 ->
+    << Len:7 >>;
+encode_len(Len) when Len =< 65535 ->
+    << 126:7, Len:16 >>;
+encode_len(Len) when Len =< 18446744073709551615 ->
+    << 127:7, Len:64 >>.    
+
+decode_len(<<127:7, Len:64, Rest/bytes>>) ->
+    {Len, Rest};
+decode_len(<<126:7, Len:16, Rest/bytes>>) ->
+    {Len, Rest};
+decode_len(<<Len:7, Rest/bytes>>) ->
+    {Len, Rest}.
+
 %% handshake_request(Url) ->
 %%     {ok,{ws,[],Host,Port,Path,[]}} = http_uri:parse(Url).
     
