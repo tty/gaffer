@@ -4,7 +4,7 @@
 -export([start/0,stop/0]).
 -export([new_client/1]).
 -export([connect/1]).
--export([send/2]).
+-export([send_text/2,send_binary/2,ping/1]).
 
 %%----------------------------------------------------------------------------
 %% API
@@ -23,9 +23,15 @@ new_client(Url) ->
 connect(Client) ->
     gaffer_ws_client:connect(Client).
 
-send(Client,Data) ->
-    gaffer_ws_client:send(Client, Data).
+send_binary(Client,Data) ->
+    gaffer_ws_client:send_binary(Client, Data).
     
+send_text(Client,Data) ->
+    gaffer_ws_client:send_text(Client, Data).
+
+ping(Client) ->
+    gaffer_ws_client:ping(Client).
+
 %% Local variables:
 %% mode: erlang
 %% fill-column: 78

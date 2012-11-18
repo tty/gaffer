@@ -5,8 +5,8 @@
 %% API
 -export([start_link/1]).
 -export([connect/1]).
--export([send/2]).
--export([frame/1]).
+-export([send_text/2,send_binary/2,ping/1]).
+-export([frame/2]).
 -export([unframe/1]).
 -export([decode_len/1]).
 -export([encode_len/1]).
@@ -22,18 +22,32 @@
 -define(OPEN, 2).
 -define(CLOSED, 3).
 
+-define(OP_cont, 0).
+-define(OP_TEXT, 1).
+-define(OP_BINARY, 2).
+-define(OP_CLOSE, 8).
+-define(OP_PING, 9).
+-define(OP_PONG, 10).
+
 -define(SERVER, ?MODULE). 
 
--record(state, {readystate,key,host,port,path,sock,headers}).
+-record(state, {readystate,key,host,port,path,sock,headers,listener,buffer,
+		contop}).
 
 %%----------------------------------------------------------------------------
 %% API
 %%----------------------------------------------------------------------------
 connect(Pid) ->
-    gen_server:cast(Pid, connect).
+    gen_server:cast(Pid, {connect, self()}).
 
-send(Pid, Data) ->
-   gen_server:cast(Pid, {send, Data}).
+send_text(Pid, Text) ->
+    gen_server:cast(Pid, {send, ?OP_TEXT, Text}).
+
+send_binary(Pid, Data) ->
+    gen_server:cast(Pid, {send, ?OP_BINARY, Data}).
+
+ping(Pid) ->
+    gen_server:cast(Pid, {send, ?OP_PING, <<>>}).
 
 start_link(Url) ->
     gen_server:start_link(?MODULE, [Url], []).
@@ -44,40 +58,53 @@ start_link(Url) ->
 
 init([Url]) ->
     {ok,{ws,[],Host,Port,Path,[]}} = http_uri:parse(Url),
-    {ok, #state{readystate = ?DISCONNECTED, key = key(), host = Host, port = Port, path = Path}}.
+    {ok, #state{readystate = ?DISCONNECTED, key = key(), host = Host, 
+		port = Port, path = Path,buffer = <<>>}}.
 
 handle_call(_Request, _From, State) ->
-    Reply = ok,
-    {reply, Reply, State}.
+    {reply, ok, State}.
 
-handle_cast(connect, State = #state{host = Host, port = Port, path = Path, key = Key}) ->
-    {ok, Sock} = gen_tcp:connect(Host, Port, [binary, {packet, 0},{active,true}]),
+handle_cast({connect,Pid}, State = #state{host = Host, port = Port, 
+					  path = Path, key = Key}) ->
+    {ok, Sock} = gen_tcp:connect(Host, Port, [binary, {packet, 0},
+					      {active,true}]),
     Req = initial_request(Host, Port, Path, Key),
     inet:setopts(Sock, [{packet, http}]),
     ok = gen_tcp:send(Sock, Req),
-    {noreply, State#state{sock = Sock}};
-handle_cast({send, Data}, State = #state{sock = Sock}) ->
-    io:format("Sending: ~p~n", [Data]),
-    Result = gen_tcp:send(Sock, frame(Data)),
-    io:format("result: ~p~n", [Result]),
+    {noreply, State#state{sock = Sock, listener = Pid}};
+handle_cast({send, Op, Data}, State = #state{sock = Sock}) ->
+    ok = gen_tcp:send(Sock, frame(Op,Data)),
     {noreply, State}.
 
-handle_info({http,_,{http_response,{1,1},101,_}}, State = #state{readystate = ?DISCONNECTED}) ->
+handle_info({http,_,{http_response,{1,1},101,_}}, 
+	    State = #state{readystate = ?DISCONNECTED}) ->
     {noreply, State#state{readystate = ?CONNECTING}};
-handle_info({http,_,{http_header,_,Name,_,Value}}, State = #state{readystate = ?CONNECTING}) ->
+handle_info({http,_,{http_header,_,Name,_,Value}}, 
+	    State = #state{readystate = ?CONNECTING}) ->
     H = [{Name, Value} | State#state.headers],
     {noreply, State#state{headers=H}};
-handle_info({http,_,http_eoh},State) ->
+handle_info({http,_,http_eoh}, State = #state{readystate = ?CONNECTING}) ->
     {noreply, handshake(State)};
-handle_info({tcp,_,Data}, State = #state{readystate = ?OPEN}) ->
-    handleframe(Data),
-    {noreply, State};
+handle_info({tcp,_,Frame}, State = #state{readystate = ?OPEN, sock = Sock,
+					  contop = Cop,
+					  listener = Listener,
+					  buffer = Buffer}) ->
+    New_state = case unframe(Frame) of
+		    {Op, Data, 0} ->
+			State#state{buffer = <<Buffer/binary, Data/binary>>, 
+				    contop = cont_op(Cop, Op)}; 
+		    {Op, Data, 1} -> 
+                        Opcode = cont_op(Cop, Op),
+			Listener ! {Opcode, <<Buffer/binary, Data/binary>>},
+			handle_control(Opcode, Sock),
+			State#state{buffer = <<>>} 
+		end,
+    {noreply, New_state};
 handle_info({tcp_closed, _Socket},State) ->
-    {stop,normal,State};
+    {stop,normal,State#state{readystate = ?CLOSED}};
 handle_info({tcp_error, _Socket, _Reason},State) ->
-    {stop,tcp_error,State};
-handle_info(Info, State) ->
-    io:format("INFO = ~p~n", [Info]),
+    {stop,tcp_error,State#state{readystate = ?CLOSED}};
+handle_info(_, State) ->
     {noreply, State}.
 
 terminate(_Reason, _State) ->
@@ -90,10 +117,23 @@ code_change(_OldVsn, State, _Extra) ->
 %%----------------------------------------------------------------------------
 %% Internal functions 
 %%----------------------------------------------------------------------------
+handle_control(close, Sock) ->
+    gen_tcp:close(Sock);
+handle_control(ping, Sock) ->
+    gen_tcp:send(Sock, frame(?OP_PONG,<<>>));
+handle_control(_,_) ->
+    ok.
+
+cont_op(Cop, ?OP_cont) ->
+    Cop;
+cont_op(_, Op) ->
+    Op.
+
 key() ->
     {A1,A2,A3} = now(),
     random:seed(A1,A2,A3),
-    binary_to_list(base64:encode(<< <<(random:uniform(256))>> || _N <- lists:seq(1,16) >>)).
+    binary_to_list(
+      base64:encode(<< <<(random:uniform(256))>> || _N <- lists:seq(1,16)>>)).
 
 initial_request(Host,Port, Path, Key) ->
     "GET "++ Path ++" HTTP/1.1\r\n" ++
@@ -103,24 +143,21 @@ initial_request(Host,Port, Path, Key) ->
     "Sec-WebSocket-Version: 13\r\n" ++
     "Sec-WebSocket-Key: " ++ Key ++ "\r\n\r\n".
 
-handshake(State = #state{readystate = ?CONNECTING, sock = Sock, key = Key, headers = Headers}) ->
+handshake(State = #state{readystate = ?CONNECTING, sock = Sock, key = Key, 
+			 headers = Headers}) ->
     "upgrade" = string:to_lower(proplists:get_value('Connection', Headers)),
     "websocket" = string:to_lower(proplists:get_value('Upgrade', Headers)),
-    SecWebsocketAccept = proplists:get_value("Sec-Websocket-Accept", Headers),
-    Expected = binary_to_list(base64:encode(crypto:sha(Key ++ "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))),
-    case SecWebsocketAccept =:= Expected of 
+    Accept = proplists:get_value("Sec-Websocket-Accept", Headers),
+    MagicString = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11",
+    Expected = binary_to_list(base64:encode(crypto:sha(Key ++ MagicString))),
+    case Accept =:= Expected of 
         true -> 
-            io:format("Connectionstate: Open, handshake complete!!"),
             inet:setopts(Sock, [{packet, raw}]),
             State#state{readystate = ?OPEN};
         _ -> 
-            io:format("Connectionstate: Closed, invalid handshake"),
             State#state{readystate = ?CLOSED}
     end.
     
-handleframe(Data) ->
-  unframe(Data).
-
 mask(<<>>, _) ->
     <<>>;
 mask(<<D:24>>, <<M:24, _:8>>) ->
@@ -132,30 +169,31 @@ mask(<<D>>, <<M, _:24>>) ->
 mask(<<D:32, Rest/bits >>, M) ->
    Data = crypto:exor(<<D:32>>, M),
    MaskedRest = mask(Rest, M),
-   %% io:format("Maskedrest: ~p Data: ~p ~n", [MaskedRest,Data]),
    << Data:32/bits, MaskedRest/bits >>.
 
 unmask(0, Data) ->
     Data;
 unmask(1, << Mask:32, Data/bits >> ) ->
-    io:format("Mask: ~p ~n", [Mask]),
     mask(Data, <<Mask:32>>).
 
-unframe(<< F:1, R:3, Op:4, M:1, Data/bits >>) ->
-    io:format("Frame received F: ~p R: ~p Op: ~p M: ~p~n", [F,R,Op,M]),
-    {Len, Rest} = decode_len(Data),
-    io:format("Payload len: ~p ~n", [Len]),
-    unmask(M,Rest).
+op_to_atom(?OP_TEXT) -> text;
+op_to_atom(?OP_BINARY) -> binary; 
+op_to_atom(?OP_PING) -> ping; 
+op_to_atom(?OP_PONG) -> pong; 
+op_to_atom(?OP_CLOSE) -> close. 
 
-frame(Data) ->
+unframe(<< F:1, _:3, Op:4, M:1, Data/bits >>) ->
+    {Len, Rest} = decode_len(Data),
+    Len = byte_size(Rest),
+    {op_to_atom(Op),unmask(M,Rest),F}.
+
+frame(Op, Data) ->
     F = 1,
     R = 0,
-    Op = 1,
     M = 1,
     Size = byte_size( Data ),
     Len = encode_len(Size),
     Mask = random:uniform(4294967296),
-    %% io:format("Frame received F: ~p R: ~p Op: ~p M: ~p Len: ~p ~n", [F,R,Op,M,Len]),
     MaskedData = mask(Data, <<Mask:32>>),
     << F:1, R:3, Op:4, M:1, Len/bits, Mask:32, MaskedData/binary >>.
 
@@ -173,9 +211,6 @@ decode_len(<<126:7, Len:16, Rest/bytes>>) ->
 decode_len(<<Len:7, Rest/bytes>>) ->
     {Len, Rest}.
 
-%% handshake_request(Url) ->
-%%     {ok,{ws,[],Host,Port,Path,[]}} = http_uri:parse(Url).
-    
 %% Local variables:
 %% mode: erlang
 %% fill-column: 78
