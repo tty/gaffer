@@ -32,7 +32,6 @@
                 host, port, path,
                 sock,
                 headers,
-                listener,
                 buffer = <<>>,
                 op_cont,
                 recv_frames = []}).
@@ -42,7 +41,7 @@
 %%----------------------------------------------------------------------------
 
 connect(Pid) ->
-    gen_server:cast(Pid, {connect, self()}).
+    gen_server:cast(Pid, connect).
 
 get_frames(Pid) ->
     gen_server:call(Pid, get_frames).
@@ -79,14 +78,14 @@ handle_call(_Request, _From, State) ->
 
 handle_cast(flush_frames, State) ->
     {noreply, State#state{recv_frames = []}};
-handle_cast({connect, Pid}, State = #state{host = Host, port = Port,
-                                           path = Path, key = Key}) ->
+handle_cast(connect, State = #state{host = Host, port = Port,
+                                    path = Path, key = Key}) ->
     {ok, Sock} = gen_tcp:connect(Host, Port, [binary, {packet, 0},
                                               {active,true}]),
     Req = initial_request(Host, Port, Path, Key),
     inet:setopts(Sock, [{packet, http}]),
     ok = gen_tcp:send(Sock, Req),
-    {noreply, State#state{sock = Sock, listener = Pid}};
+    {noreply, State#state{sock = Sock}};
 handle_cast(
   {send, Op, Data},
   State = #state{sock = Sock, readystate = ?OPEN}
