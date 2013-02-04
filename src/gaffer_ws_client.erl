@@ -4,6 +4,7 @@
 
 %% API
 -export([connect/1]).
+-export([get_frames/1, flush_frames/1]).
 -export([send_text/2, send_binary/2]).
 -export([ping/1]).
 -export([start_link/1]).
@@ -33,7 +34,8 @@
                 headers,
                 listener,
                 buffer = <<>>,
-                op_cont}).
+                op_cont,
+                recv_frames = []}).
 
 %%----------------------------------------------------------------------------
 %% API
@@ -41,6 +43,12 @@
 
 connect(Pid) ->
     gen_server:cast(Pid, {connect, self()}).
+
+get_frames(Pid) ->
+    gen_server:call(Pid, get_frames).
+
+flush_frames(Pid) ->
+    gen_server:cast(Pid, flush_frames).
 
 send_text(Pid, Text) ->
     gen_server:cast(Pid, {send, ?OP_TEXT, Text}).
@@ -64,9 +72,13 @@ init([Url]) ->
                 key = key(),
                 host = Host, port = Port, path = Path}}.
 
+handle_call(get_frames, _From, State = #state{recv_frames = Fs}) ->
+    {reply, Fs, State};
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
 
+handle_cast(flush_frames, State) ->
+    {noreply, State#state{recv_frames = []}};
 handle_cast({connect, Pid}, State = #state{host = Host, port = Port,
                                            path = Path, key = Key}) ->
     {ok, Sock} = gen_tcp:connect(Host, Port, [binary, {packet, 0},
@@ -75,8 +87,10 @@ handle_cast({connect, Pid}, State = #state{host = Host, port = Port,
     inet:setopts(Sock, [{packet, http}]),
     ok = gen_tcp:send(Sock, Req),
     {noreply, State#state{sock = Sock, listener = Pid}};
-handle_cast({send, Op, Data},
-            State = #state{sock = Sock, readystate = ?OPEN}) ->
+handle_cast(
+  {send, Op, Data},
+  State = #state{sock = Sock, readystate = ?OPEN}
+ ) ->
     ok = gen_tcp:send(Sock, frame(Op,Data)),
     {noreply, State}.
 
@@ -91,17 +105,18 @@ handle_info({http, _, http_eoh}, State = #state{readystate = ?CONNECTING}) ->
 handle_info({tcp,_,Frame}, State = #state{readystate = ?OPEN,
                                           sock = Sock,
                                           op_cont = Cop,
-                                          listener = Listener,
-                                          buffer = Buffer}) ->
+                                          buffer = Buffer,
+                                          recv_frames = Frames}) ->
     New_state = case unframe(Frame) of
                     {Op, Data, 0} ->
                         State#state{buffer = <<Buffer/binary, Data/binary>>,
                                     op_cont = op_cont(Cop, Op)};
                     {Op, Data, 1} ->
                         Opcode = op_cont(Cop, Op),
-                        Listener ! {Opcode, <<Buffer/binary, Data/binary>>},
+                        NewFrame = {Opcode, <<Buffer/binary, Data/binary>>},
                         handle_control(Opcode, Sock),
-                        State#state{buffer = <<>>}
+                        State#state{buffer = <<>>,
+                                    recv_frames = [NewFrame | Frames]}
                 end,
     {noreply, New_state};
 handle_info({tcp_closed, _Socket}, State) ->
