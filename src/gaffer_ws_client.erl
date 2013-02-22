@@ -170,7 +170,8 @@ handshake(State = #state{readystate = ?CONNECTING, sock = Sock, key = Key,
     Expected = binary_to_list(base64:encode(crypto:sha(Key ++ MagicString))),
     case Accept =:= Expected of
         true ->
-            inet:setopts(Sock, [{packet, raw}]),
+            inet:setopts(Sock, [{packet, raw}, {buffer, 1400000},
+                                {packet_size,0}]),
             State#state{readystate = ?OPEN};
         _ ->
             State#state{readystate = ?CLOSED}
