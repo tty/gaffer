@@ -4,10 +4,11 @@
 
 %% API
 -export([connect/1]).
--export([get_frames/1, flush_frames/1]).
 -export([send_text/2, send_binary/2]).
 -export([ping/1]).
 -export([start_link/1]).
+-export([get_frame/1]).
+-export([get_readystate/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
@@ -32,6 +33,7 @@
                 host, port, path,
                 sock,
                 headers,
+                raw_buffer = <<>>,
                 buffer = <<>>,
                 op_cont,
                 recv_frames = []}).
@@ -41,13 +43,14 @@
 %%----------------------------------------------------------------------------
 
 connect(Pid) ->
-    gen_server:cast(Pid, connect).
+    ok = gen_server:call(Pid, connect),
+    wait_for_connect(Pid).
 
-get_frames(Pid) ->
-    gen_server:call(Pid, get_frames).
+get_readystate(Pid) ->
+    gen_server:call(Pid, get_readystate).
 
-flush_frames(Pid) ->
-    gen_server:cast(Pid, flush_frames).
+get_frame(Pid) ->
+    gen_server:call(Pid, get_frame).
 
 send_text(Pid, Text) ->
     gen_server:cast(Pid, {send, ?OP_TEXT, Text}).
@@ -71,21 +74,23 @@ init([Url]) ->
                 key = key(),
                 host = Host, port = Port, path = Path}}.
 
-handle_call(get_frames, _From, State = #state{recv_frames = Fs}) ->
-    {reply, Fs, State};
-handle_call(_Request, _From, State) ->
-    {reply, ok, State}.
-
-handle_cast(flush_frames, State) ->
-    {noreply, State#state{recv_frames = []}};
-handle_cast(connect, State = #state{host = Host, port = Port,
+handle_call(connect, _From, State = #state{host = Host, port = Port,
                                     path = Path, key = Key}) ->
     {ok, Sock} = gen_tcp:connect(Host, Port, [binary, {packet, 0},
                                               {active,true}]),
     Req = initial_request(Host, Port, Path, Key),
     inet:setopts(Sock, [{packet, http}]),
     ok = gen_tcp:send(Sock, Req),
-    {noreply, State#state{sock = Sock}};
+    {reply, ok, State#state{sock = Sock}};
+handle_call(get_readystate, _From, State = #state{readystate = S}) ->
+    {reply, S, State};
+handle_call(get_frame, _From, State = #state{readystate = ?OPEN}) ->
+    {Frame, NewState} = receive_frame(State),
+    {reply, Frame, NewState};
+handle_call(get_frame, _From, State) ->
+    {reply, {error,connection_not_open}, State};
+handle_call(_Request, _From, State) ->
+    {reply, ok, State}.
 handle_cast(
   {send, Op, Data},
   State = #state{sock = Sock, readystate = ?OPEN}
@@ -101,23 +106,6 @@ handle_info({http, _, {http_header, _, Name, _, Value}},
     {noreply, State#state{headers = [{Name, Value} | Hs]}};
 handle_info({http, _, http_eoh}, State = #state{readystate = ?CONNECTING}) ->
     {noreply, handshake(State)};
-handle_info({tcp,_,Frame}, State = #state{readystate = ?OPEN,
-                                          sock = Sock,
-                                          op_cont = Cop,
-                                          buffer = Buffer,
-                                          recv_frames = Frames}) ->
-    New_state = case unframe(Frame) of
-                    {Op, Data, 0} ->
-                        State#state{buffer = <<Buffer/binary, Data/binary>>,
-                                    op_cont = op_cont(Cop, Op)};
-                    {Op, Data, 1} ->
-                        Opcode = op_cont(Cop, Op),
-                        NewFrame = {Opcode, <<Buffer/binary, Data/binary>>},
-                        handle_control(Opcode, Sock),
-                        State#state{buffer = <<>>,
-                                    recv_frames = [NewFrame | Frames]}
-                end,
-    {noreply, New_state};
 handle_info({tcp_closed, _Socket}, State) ->
     {stop, normal, State#state{readystate = ?CLOSED}};
 handle_info({tcp_error, _Socket, _Reason},State) ->
@@ -134,6 +122,44 @@ code_change(_OldVsn, State, _Extra) ->
 %%----------------------------------------------------------------------------
 %% Internal functions
 %%----------------------------------------------------------------------------
+wait_for_connect(Pid) ->
+    timer:sleep(2),
+    case get_readystate(Pid) of 
+        ?DISCONNECTED ->
+            wait_for_connect(Pid);
+        ?CONNECTING ->
+            wait_for_connect(Pid);
+        ?OPEN->
+            {Pid, open};
+        ?CLOSED ->
+            {Pid, closed}
+    end.
+
+receive_frame(State = #state{sock = Sock, 
+                             raw_buffer = RawBuffer, 
+                             op_cont = Cop,
+                             buffer = Buffer,
+                             recv_frames = Frames}) ->
+    case gen_tcp:recv(Sock, 0) of
+        {ok, B} ->
+            NewBuffer = <<RawBuffer/binary, B/binary>>,
+            case unframe(NewBuffer) of
+                {incomplete, _, _, _, _} ->
+                    receive_frame(State#state{raw_buffer = NewBuffer});
+                {complete, Op, Data, 0, RestBuffer} ->
+                    receive_frame(State#state{buffer = <<Buffer/binary, Data/binary>>,
+                                raw_buffer = RestBuffer,
+                                op_cont = op_cont(Cop, Op)});
+                {complete, Op, Data, 1, RestBuffer} ->
+                    Opcode = op_cont(Cop, Op),
+                    NewFrame = {Opcode, <<Buffer/binary, Data/binary>>},
+                    handle_control(Opcode, Sock),
+                    {NewFrame, State#state{buffer = <<>>,
+                                raw_buffer = RestBuffer,
+                                recv_frames = Frames ++ [NewFrame]}}
+            end;
+        {error, closed} -> State#state{readystate = ?CLOSED, buffer = <<>>, raw_buffer = <<>>}
+    end.
 
 handle_control(close, Sock) ->
     gen_tcp:close(Sock);
@@ -170,8 +196,7 @@ handshake(State = #state{readystate = ?CONNECTING, sock = Sock, key = Key,
     Expected = binary_to_list(base64:encode(crypto:sha(Key ++ MagicString))),
     case Accept =:= Expected of
         true ->
-            inet:setopts(Sock, [{packet, raw}, {buffer, 1400000},
-                                {packet_size,0}]),
+            inet:setopts(Sock, [{packet, raw},{active, false},{packet_size,0}]),
             State#state{readystate = ?OPEN};
         _ ->
             State#state{readystate = ?CLOSED}
@@ -201,10 +226,22 @@ op_to_atom(?OP_PING) -> ping;
 op_to_atom(?OP_PONG) -> pong;
 op_to_atom(?OP_CLOSE) -> close.
 
+complete_payload(Len, Size) when Len =< Size ->
+    complete;
+complete_payload(_,_) ->
+    incomplete.
+
+unframe(Data) when byte_size(Data) < 2 ->
+    {incomplete, 0,<<>>,0,Data};
 unframe(<< F:1, _:3, Op:4, M:1, Data/bits >>) ->
-    {Len, Rest} = decode_len(Data),
-    Len = byte_size(Rest),
-    {op_to_atom(Op),unmask(M,Rest),F}.
+    {Len, Buf} = decode_len(Data),
+    case complete_payload(Len,byte_size(Buf)) of 
+         complete ->
+             <<Payload:Len/bytes,Rest/bytes>> = Buf,
+            {complete_payload(Len,byte_size(Payload)),op_to_atom(Op),unmask(M,Payload),F,Rest};
+        incomplete ->
+            {incomplete, 0,<<>>,0,Data}
+    end.
 
 frame(Op, Data) ->
     F = 1,
