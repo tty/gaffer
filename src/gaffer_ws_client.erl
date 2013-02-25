@@ -9,6 +9,7 @@
 -export([start_link/1]).
 -export([get_frame/1]).
 -export([get_readystate/1]).
+-export([decode_len/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
@@ -33,10 +34,9 @@
                 host, port, path,
                 sock,
                 headers,
-                raw_buffer = <<>>,
-                buffer = <<>>,
-                op_cont,
-                recv_frames = []}).
+                data_buffer = <<>>,
+                frame_buffer = <<>>,
+                op_cont}).
 
 %%----------------------------------------------------------------------------
 %% API
@@ -85,16 +85,15 @@ handle_call(connect, _From, State = #state{host = Host, port = Port,
 handle_call(get_readystate, _From, State = #state{readystate = S}) ->
     {reply, S, State};
 handle_call(get_frame, _From, State = #state{readystate = ?OPEN}) ->
-    {Frame, NewState} = receive_frame(State),
-    {reply, Frame, NewState};
+    {Result, NewState} = receive_frame(State),
+    {reply, Result, NewState};
 handle_call(get_frame, _From, State) ->
     {reply, {error,connection_not_open}, State};
 handle_call(_Request, _From, State) ->
     {reply, ok, State}.
 handle_cast(
   {send, Op, Data},
-  State = #state{sock = Sock, readystate = ?OPEN}
- ) ->
+  State = #state{sock = Sock, readystate = ?OPEN}) ->
     ok = gen_tcp:send(Sock, frame(Op,Data)),
     {noreply, State}.
 
@@ -136,36 +135,27 @@ wait_for_connect(Pid) ->
     end.
 
 receive_frame(State = #state{sock = Sock, 
-                             raw_buffer = RawBuffer, 
+                             data_buffer = Data, 
                              op_cont = Cop,
-                             buffer = Buffer,
-                             recv_frames = Frames}) ->
-    case gen_tcp:recv(Sock, 0) of
-        {ok, B} ->
-            NewBuffer = <<RawBuffer/binary, B/binary>>,
-            case unframe(NewBuffer) of
-                {incomplete, _, _, _, _} ->
-                    receive_frame(State#state{raw_buffer = NewBuffer});
-                {complete, Op, Data, 0, RestBuffer} ->
-                    receive_frame(State#state{buffer = <<Buffer/binary, Data/binary>>,
-                                raw_buffer = RestBuffer,
-                                op_cont = op_cont(Cop, Op)});
-                {complete, Op, Data, 1, RestBuffer} ->
-                    Opcode = op_cont(Cop, Op),
-                    NewFrame = {Opcode, <<Buffer/binary, Data/binary>>},
-                    handle_control(Opcode, Sock),
-                    {NewFrame, State#state{buffer = <<>>,
-                                raw_buffer = RestBuffer,
-                                recv_frames = Frames ++ [NewFrame]}}
-            end;
-        {error, closed} -> State#state{readystate = ?CLOSED, buffer = <<>>, raw_buffer = <<>>}
+                             frame_buffer = FrameBuf}) ->
+    case recv_data(Sock, Data) of
+	{Op, Payload, 0, RestData}  -> 
+	    receive_frame(State#state{frame_buffer = <<FrameBuf/binary, Payload/binary>>,
+				      data_buffer = RestData,
+				      op_cont = op_cont(Cop, Op)});
+	{Op, Payload, 1, RestData} ->
+	    Opcode = op_cont(Cop, Op),
+	    CompleteFrame = {Opcode, <<FrameBuf/binary, Payload/binary>>},
+	    handle_control(Opcode, Sock),
+	    {CompleteFrame, State#state{frame_buffer = <<>>, data_buffer = RestData}};
+	_ -> {error, State#state{readystate = ?CLOSED, frame_buffer = <<>>, data_buffer = <<>>}}
     end.
 
 handle_control(close, Sock) ->
     gen_tcp:close(Sock);
 handle_control(ping, Sock) ->
     gen_tcp:send(Sock, frame(?OP_PONG,<<>>));
-handle_control(_,_) ->
+handle_control(_, _) ->
     ok.
 
 op_cont(Cop, ?OP_CONT) ->
@@ -205,43 +195,56 @@ handshake(State = #state{readystate = ?CONNECTING, sock = Sock, key = Key,
 mask(<<>>, _) ->
     <<>>;
 mask(<<D:24>>, <<M:24, _:8>>) ->
-   crypto:exor(<<D:24>>, <<M:24>>);
+    crypto:exor(<<D:24>>, <<M:24>>);
 mask(<<D:16>>, <<M:16, _:16>>) ->
-   crypto:exor(<<D:16>>, <<M:16>>);
+    crypto:exor(<<D:16>>, <<M:16>>);
 mask(<<D>>, <<M, _:24>>) ->
-   crypto:exor(<<D:8>>, <<M:8>>);
+    crypto:exor(<<D:8>>, <<M:8>>);
 mask(<<D:32, Rest/bits >>, M) ->
-   Data = crypto:exor(<<D:32>>, M),
-   MaskedRest = mask(Rest, M),
-   << Data:32/bits, MaskedRest/bits >>.
+    Data = crypto:exor(<<D:32>>, M),
+    MaskedRest = mask(Rest, M),
+    << Data:32/bits, MaskedRest/bits >>.
 
 unmask(0, Data) ->
     Data;
 unmask(1, << Mask:32, Data/bits >> ) ->
     mask(Data, <<Mask:32>>).
 
+op_to_atom(?OP_CONT) -> cont;
 op_to_atom(?OP_TEXT) -> text;
 op_to_atom(?OP_BINARY) -> binary;
 op_to_atom(?OP_PING) -> ping;
 op_to_atom(?OP_PONG) -> pong;
 op_to_atom(?OP_CLOSE) -> close.
 
-complete_payload(Len, Size) when Len =< Size ->
-    complete;
-complete_payload(_,_) ->
-    incomplete.
+contains_full_frame(Data) when byte_size(Data) < 2 ->
+     false;
+contains_full_frame(<< _:9, Data/bits >>) ->
+    case decode_len(Data) of
+	error -> 
+	    false;
+	{Len, Rest} -> 
+	    byte_size(Rest) >= Len
+    end.
+  
+recv_data(Sock, Buf) ->
+    {Stat, B} = gen_tcp:recv(Sock, 0),
+    case Stat of
+         ok ->
+            NewBuf = << Buf/binary, B/binary >>, 
+	    case contains_full_frame(NewBuf) of
+		true ->
+		    unframe(NewBuf);
+		_ ->
+		    recv_data(Sock, NewBuf)
+	    end; 
+	error -> error
+    end.
 
-unframe(Data) when byte_size(Data) < 2 ->
-    {incomplete, 0,<<>>,0,Data};
 unframe(<< F:1, _:3, Op:4, M:1, Data/bits >>) ->
     {Len, Buf} = decode_len(Data),
-    case complete_payload(Len,byte_size(Buf)) of 
-         complete ->
-             <<Payload:Len/bytes,Rest/bytes>> = Buf,
-            {complete_payload(Len,byte_size(Payload)),op_to_atom(Op),unmask(M,Payload),F,Rest};
-        incomplete ->
-            {incomplete, 0,<<>>,0,Data}
-    end.
+    <<Payload:Len/bytes,RestBuf/bytes>> = Buf,
+    {op_to_atom(Op),unmask(M,Payload),F,RestBuf}.
 
 frame(Op, Data) ->
     F = 1,
@@ -255,9 +258,9 @@ frame(Op, Data) ->
 
 encode_len(Len) when Len < 126 ->
     << Len:7 >>;
-encode_len(Len) when Len =< 65535 ->
+encode_len(Len) when Len =< 16#ffff ->
     << 126:7, Len:16 >>;
-encode_len(Len) when Len =< 18446744073709551615 ->
+encode_len(Len) when Len =< 16#7fffffffffffffff ->
     << 127:7, Len:64 >>.
 
 decode_len(<<127:7, Len:64, Rest/bytes>>) ->
@@ -265,7 +268,11 @@ decode_len(<<127:7, Len:64, Rest/bytes>>) ->
 decode_len(<<126:7, Len:16, Rest/bytes>>) ->
     {Len, Rest};
 decode_len(<<Len:7, Rest/bytes>>) ->
-    {Len, Rest}.
+    case Len of 
+         127 -> error;
+         126 -> error;
+         _ -> {Len, Rest}
+    end.
 
 %% Local variables:
 %% mode: erlang
