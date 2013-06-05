@@ -31,6 +31,7 @@
 
 -record(state, {readystate,
                 key,
+                transport,
                 host, port, path,
                 sock,
                 headers,
@@ -69,18 +70,29 @@ start_link(Url) ->
 %%----------------------------------------------------------------------------
 
 init([Url]) ->
-    {ok,{ws,[],Host,Port,Path,[]}} = http_uri:parse(Url),
+    {ok,{Protocol,[],Host,Port,Path,[]}} = http_uri:parse(Url, [{scheme_defaults, [{ws,80},{wss,443}]}]),
+    Transport = case Protocol of
+                    wss -> ssl;
+                    ws -> gen_tcp
+                end,
     {ok, #state{readystate = ?DISCONNECTED,
                 key = key(),
-                host = Host, port = Port, path = Path}}.
+                transport = Transport, host = Host, port = Port, path = Path}}.
 
-handle_call(connect, _From, State = #state{host = Host, port = Port,
+handle_call(connect, _From, State = #state{transport = Transport, host = Host, port = Port,
                                     path = Path, key = Key}) ->
-    {ok, Sock} = gen_tcp:connect(Host, Port, [binary, {packet, 0},
+    Opts = case Transport of
+               ssl -> [{verify, verify_none}];
+               _ -> []
+           end,
+    {ok, Sock} = Transport:connect(Host, Port, Opts ++ [binary, {packet, 0},
                                               {active,true}]),
     Req = initial_request(Host, Port, Path, Key),
-    inet:setopts(Sock, [{packet, http}]),
-    ok = gen_tcp:send(Sock, Req),
+    case Transport of
+       ssl -> ssl:setopts(Sock, [{packet, http}]);
+       _ -> inet:setopts(Sock, [{packet, http}])
+    end,
+    ok = Transport:send(Sock, Req),
     {reply, ok, State#state{sock = Sock}};
 handle_call(get_readystate, _From, State = #state{readystate = S}) ->
     {reply, S, State};
@@ -93,19 +105,21 @@ handle_call(_Request, _From, State) ->
     {reply, ok, State}.
 handle_cast(
   {send, Op, Data},
-  State = #state{sock = Sock, readystate = ?OPEN}) ->
-    ok = gen_tcp:send(Sock, frame(Op,Data)),
+  State = #state{transport = Transport, sock = Sock, readystate = ?OPEN}) ->
+    ok = Transport:send(Sock, frame(Op,Data)),
     {noreply, State}.
 
-handle_info({http, _, {http_response, {1, 1} , 101, _}},
+handle_info({_, _, {http_response, {1, 1} , 101, _}},
             State = #state{readystate = ?DISCONNECTED}) ->
     {noreply, State#state{readystate = ?CONNECTING}};
-handle_info({http, _, {http_header, _, Name, _, Value}},
+handle_info({_, _, {http_header, _, Name, _, Value}},
             State = #state{readystate = ?CONNECTING, headers = Hs}) ->
     {noreply, State#state{headers = [{Name, Value} | Hs]}};
-handle_info({http, _, http_eoh}, State = #state{readystate = ?CONNECTING}) ->
+handle_info({_, _, http_eoh}, State = #state{readystate = ?CONNECTING}) ->
     {noreply, handshake(State)};
 handle_info({tcp_closed, _Socket}, State) ->
+    {stop, normal, State#state{readystate = ?CLOSED}};
+handle_info({ssl_closed, _Socket}, State) ->
     {stop, normal, State#state{readystate = ?CLOSED}};
 handle_info({tcp_error, _Socket, _Reason},State) ->
     {stop, tcp_error, State#state{readystate = ?CLOSED}};
@@ -134,11 +148,12 @@ wait_for_connect(Pid) ->
             {Pid, closed}
     end.
 
-receive_frame(State = #state{sock = Sock, 
+receive_frame(State = #state{transport = Transport,
+                             sock = Sock, 
                              data_buffer = Data, 
                              op_cont = Cop,
                              frame_buffer = FrameBuf}) ->
-    case recv_data(Sock, Data) of
+    case recv_data(Sock, Data, Transport) of
 	{Op, Payload, 0, RestData}  -> 
 	    receive_frame(State#state{frame_buffer = <<FrameBuf/binary, Payload/binary>>,
 				      data_buffer = RestData,
@@ -146,16 +161,16 @@ receive_frame(State = #state{sock = Sock,
 	{Op, Payload, 1, RestData} ->
 	    Opcode = op_cont(Cop, Op),
 	    CompleteFrame = {Opcode, <<FrameBuf/binary, Payload/binary>>},
-	    handle_control(Opcode, Sock),
+	    handle_control(Opcode, Sock, Transport),
 	    {CompleteFrame, State#state{frame_buffer = <<>>, data_buffer = RestData}};
 	_ -> {error, State#state{readystate = ?CLOSED, frame_buffer = <<>>, data_buffer = <<>>}}
     end.
 
-handle_control(close, Sock) ->
-    gen_tcp:close(Sock);
-handle_control(ping, Sock) ->
-    gen_tcp:send(Sock, frame(?OP_PONG,<<>>));
-handle_control(_, _) ->
+handle_control(close, Sock, Transport) ->
+    Transport:close(Sock);
+handle_control(ping, Sock, Transport) ->
+    Transport:send(Sock, frame(?OP_PONG,<<>>));
+handle_control(_, _,_) ->
     ok.
 
 op_cont(Cop, ?OP_CONT) ->
@@ -186,7 +201,7 @@ handshake(State = #state{readystate = ?CONNECTING, sock = Sock, key = Key,
     Expected = binary_to_list(base64:encode(crypto:sha(Key ++ MagicString))),
     case Accept =:= Expected of
         true ->
-            inet:setopts(Sock, [{packet, raw},{active, false},{packet_size,0}]),
+            ssl:setopts(Sock, [{packet, raw},{active, false},{packet_size,0}]),
             State#state{readystate = ?OPEN};
         _ ->
             State#state{readystate = ?CLOSED}
@@ -227,8 +242,8 @@ contains_full_frame(<< _:9, Data/bits >>) ->
 	    byte_size(Rest) >= Len
     end.
   
-recv_data(Sock, Buf) ->
-    {Stat, B} = gen_tcp:recv(Sock, 0),
+recv_data(Sock, Buf, Transport) ->
+    {Stat, B} = Transport:recv(Sock, 0),
     case Stat of
          ok ->
             NewBuf = << Buf/binary, B/binary >>, 
@@ -236,7 +251,7 @@ recv_data(Sock, Buf) ->
 		true ->
 		    unframe(NewBuf);
 		_ ->
-		    recv_data(Sock, NewBuf)
+		    recv_data(Sock, NewBuf, Transport)
 	    end; 
 	error -> error
     end.
