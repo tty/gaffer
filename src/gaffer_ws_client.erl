@@ -193,7 +193,7 @@ initial_request(Host,Port, Path, Key) ->
     "Sec-WebSocket-Key: " ++ Key ++ "\r\n\r\n".
 
 handshake(State = #state{readystate = ?CONNECTING, sock = Sock, key = Key,
-                         headers = Headers}) ->
+                         transport = Transport, headers = Headers}) ->
     "upgrade" = string:to_lower(proplists:get_value('Connection', Headers)),
     "websocket" = string:to_lower(proplists:get_value('Upgrade', Headers)),
     Accept = proplists:get_value("Sec-Websocket-Accept", Headers),
@@ -201,7 +201,7 @@ handshake(State = #state{readystate = ?CONNECTING, sock = Sock, key = Key,
     Expected = binary_to_list(base64:encode(crypto:sha(Key ++ MagicString))),
     case Accept =:= Expected of
         true ->
-            ssl:setopts(Sock, [{packet, raw},{active, false},{packet_size,0}]),
+            Transport:setopts(Sock, [{packet, raw},{active, false},{packet_size,0}]),
             State#state{readystate = ?OPEN};
         _ ->
             State#state{readystate = ?CLOSED}
