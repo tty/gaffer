@@ -222,7 +222,7 @@ handshake(State = #state{readystate = ?CONNECTING, sock = Sock, key = Key,
     "websocket" = string:to_lower(proplists:get_value('Upgrade', Headers)),
     Accept = proplists:get_value("Sec-Websocket-Accept", Headers),
     MagicString = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11",
-    Expected = binary_to_list(base64:encode(crypto:sha(Key ++ MagicString))),
+    Expected = binary_to_list(base64:encode(crypto:hash(sha, Key ++ MagicString))),
     case Accept =:= Expected of
         true ->
             Transport:setopts(Sock, [{packet, raw},{active, false},{packet_size,0}]),
