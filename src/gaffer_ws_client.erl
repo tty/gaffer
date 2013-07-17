@@ -232,18 +232,27 @@ handshake(State = #state{readystate = ?CONNECTING, sock = Sock, key = Key,
             State#state{readystate = ?CLOSED}
     end.
 
-mask(<<>>, _) ->
-    <<>>;
-mask(<<D:24>>, <<M:24, _:8>>) ->
-    crypto:exor(<<D:24>>, <<M:24>>);
-mask(<<D:16>>, <<M:16, _:16>>) ->
-    crypto:exor(<<D:16>>, <<M:16>>);
-mask(<<D>>, <<M, _:24>>) ->
-    crypto:exor(<<D:8>>, <<M:8>>);
-mask(<<D:32, Rest/bits >>, M) ->
-    Data = crypto:exor(<<D:32>>, M),
-    MaskedRest = mask(Rest, M),
-    << Data:32/bits, MaskedRest/bits >>.
+
+mask(Data, Mask) ->
+    << MaskKey:32 >> = Mask,
+    mask(MaskKey, Data, <<>>).
+mask(_, <<>>, Acc) ->
+    Acc;
+mask(Mask, << D:32, Rest/bits >>, Acc) ->
+    T = D bxor Mask,
+    mask(Mask, Rest, << Acc/binary, T:32 >>);
+mask(Mask, << D:24 >>, Acc) ->
+    << MaskPart:24, _:8 >> = << Mask:32 >>,
+    T = D bxor MaskPart,
+    << Acc/binary, T:24 >>;
+mask(Mask, << D:16 >>, Acc) ->
+    << MaskPart:16, _:16 >> = << Mask:32 >>,
+    T = D bxor MaskPart,
+    << Acc/binary, T:16 >>;
+mask(Mask, << D:8 >>, Acc) ->
+    << MaskPart:8, _:24 >> = << Mask:32 >>,
+    T = D bxor MaskPart,
+    << Acc/binary, T:8 >>.
 
 unmask(0, Data) ->
     Data;
